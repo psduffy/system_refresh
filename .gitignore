@@ -1,0 +1,6 @@
+# Written by each run and specific to each machine
+logs/
+refresh_config.json
+
+__pycache__/
+*.pyc

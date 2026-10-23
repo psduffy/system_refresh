@@ -1,0 +1,2 @@
+# LF everywhere, so the scripts run directly on macOS and Linux after a clone
+* text=auto eol=lf
