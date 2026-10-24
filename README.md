@@ -1,12 +1,15 @@
 # system_refresh
 
-Prunes resource bloat on a running machine without a reboot. It ends hung and orphaned
-processes, stops background helpers you name, squeezes idle memory out of background apps,
-drops caches and clears stale temp files. Every run logs a before/after snapshot and names
-the heaviest apps still running.
+Prunes resource bloat on a running machine without a reboot. It ends hung and orphaned processes, stops
+background apps you've approved, gets idle apps to give memory back, drops caches and clears stale temp files.
+Every run logs a before/after snapshot and names the heaviest apps still running.
 
-Runs on **Windows 10/11, macOS and Linux (RHEL 8+)**. One file, Python 3.6+, one dependency: `psutil`.
-`selftest.py` checks every step against bloat it creates itself (see [Self-test](#self-test)).
+Runs on **Windows 10/11, macOS and Linux (RHEL 8+)**. Needs Python 3.6+ and one package, `psutil`.
+
+It's organized around **goals**, not commands. Each OS offers different ways to reach a goal, so at startup
+the tool checks what this machine has (OS version, admin rights, available tools, kernel features) and uses the
+best way it finds. `--explain` shows what it found. `selftest.py` checks every goal against bloat it creates
+itself (see [Self-test](#self-test)).
 
 ## Get it
 
@@ -18,46 +21,62 @@ cd system_refresh
 Update later with `git pull`. Each machine keeps its own `refresh_config.json` and `logs/`. Neither is committed,
 so a pull never overwrites them.
 
-## Install
-
-| OS | Command |
+| OS | Install psutil |
 |---|---|
 | Windows | `py -m pip install psutil` |
 | macOS | `python3 -m pip install --user psutil` |
 | RHEL | `sudo dnf install python3-psutil` (or `python3 -m pip install --user psutil`) |
 
 Keep the folder somewhere permanent: the settings file and `logs/` live next to the script, and `--install`
-points the schedule at it.
+points the schedule at it. On Windows, use `py` instead of `python3` if `python3` opens the Microsoft Store.
 
 ## Use
 
 ```
-python3 system_refresh.py --dry-run          # show what would happen, change nothing
+python3 system_refresh.py --explain          # what this machine can do for each goal, and how
+python3 system_refresh.py --discover         # pick background apps to stop on every run
+python3 system_refresh.py --dry-run          # show what a run would do, change nothing
 python3 system_refresh.py                    # standard refresh
-python3 system_refresh.py --deep             # also the more forceful steps
 python3 system_refresh.py --deep --elevate   # everything, as administrator (UAC) or root (sudo)
-python3 system_refresh.py --only trim_working_sets,flush_dns
-python3 system_refresh.py --skip clean_temp_files
+python3 system_refresh.py --only release_idle_memory,flush_dns
 ```
 
-On Windows, use `py` instead of `python3` if `python3` opens the Microsoft Store.
+## Goals
 
-## Steps
+They run in this order. A goal's mode decides when it runs: `on` every time, `deep` only with `--deep`, `off`
+never. Some ways of reaching a goal are heavier than others; those are marked *deep only* and need `--deep` (or
+`--only`) even when the goal itself is `on`.
 
-They run in this order. Mode `on` runs every time, `deep` only with `--deep`, `off` never.
+| Goal | Mode | Windows | macOS | Linux |
+|---|---|---|---|---|
+| `kill_hung_apps` | deep | apps whose window is Not Responding | apps the window server flags Not Responding (undocumented call) | none: desktops show their own prompt |
+| `stop_background_apps` | on | apps you approved | apps you approved | apps you approved |
+| `prune_orphans` | deep | dev-tool trees whose parent died | same, launchd jobs excluded | same, systemd services excluded |
+| `restart_shell` | deep | Explorer, past 600 MB | Finder, past 600 MB | none |
+| `release_idle_memory` | on | trim background apps' working sets | low-memory warning to apps (`memory_pressure`), root, deep only | kernel reclaim (`memory.reclaim`), root, deep only, kernel 5.19+ |
+| `purge_memory_caches` | deep | file cache, modified and standby lists, admin | `purge`, root | drop caches and compact, root |
+| `clean_temp_files` | on | temp, crash dumps, error reports | `$TMPDIR`, diagnostic reports | `/tmp`, `/var/tmp` |
+| `flush_dns` | on | `ipconfig /flushdns` | `dscacheutil` + mDNSResponder, root | `resolvectl` or `nscd`, if one runs |
 
-| Step | Default | Windows | macOS | Linux | What it does |
-|---|---|---|---|---|---|
-| `kill_hung_apps` | deep | yes | - | - | Ends apps whose window is "Not Responding", after re-checking 10 s later |
-| `stop_background_apps` | on | yes | yes | yes | Stops the helper/updater processes you list (Windows default: Widgets, Game Bar, Java and Adobe updaters) |
-| `prune_orphans` | deep | yes | yes | yes | Ends dev-tool process trees (node, python, java, dotnet, ...) whose parent died, if older than 2 h |
-| `restart_shell` | deep | yes | yes | - | Restarts Explorer / Finder, but only once it has grown past 600 MB |
-| `trim_working_sets` | on | yes | - | - | Pushes idle pages of background apps (100 MB+) out of RAM; skips the app you're using |
-| `purge_memory_caches` | deep | admin | root | root | Windows: flushes the file cache and modified list, purges the standby list. macOS: `purge`. Linux: drops page cache, compacts memory |
-| `clean_temp_files` | on | yes | yes | yes | Deletes temp files, crash dumps and error reports older than 3 days |
-| `flush_dns` | on | yes | root | if cached | Clears the DNS resolver cache (Linux: only if systemd-resolved or nscd runs one) |
+Frozen apps are ended only if they are still frozen 10 seconds later. Orphans must be at least 2 hours old.
+Whenever a goal can't run, the run says why (wrong OS, needs admin, missing tool, old kernel) and carries on.
 
-A step that can't run on the current OS, or needs admin rights you don't have, reports `skipped` and the rest carry on.
+## Choosing background apps: `--discover`
+
+Nothing is stopped just because the tool found it. `--discover` lists the background apps you could have stopped
+on every run, heaviest first, and says why each is listed: it starts at login, it's a launch agent, it's a menu
+bar app. You pick the ones you want by number or name, and they're added to this OS's list in
+`refresh_config.json`. From then on every run stops them automatically.
+
+```
+python3 system_refresh.py --discover                          # list, then ask which to approve
+python3 system_refresh.py --discover --approve 2,OneDrive     # approve without being asked
+```
+
+It leaves out anything that's part of an app with a window (its helpers and web views, and tools it started),
+anything that's part of the OS, anything started from a terminal, processes the OS manages (systemd services) and
+protected processes. Windows ships with a starter list (Widgets, Game Bar, the Java and Adobe updaters); macOS and
+Linux start empty.
 
 ## What it will never touch
 
@@ -86,8 +105,12 @@ lists; anything you leave out keeps its default. Any setting can be split by OS:
 Names match case-insensitively, without `.exe`, and accept wildcards (`python*`). Set `"dry_run": true` to make
 every run, including scheduled ones, report without acting.
 
-`report` controls the closing summary: how many top apps to list, when to call an app heavy (1500 MB),
-and how many handles counts as a likely leak (10,000, Windows only).
+`release_idle_memory` has one setting group per OS: `min_working_set_mb` and `skip_foreground_app` (Windows),
+`pressure_level` (`warn` or `critical`) and `pressure_seconds` (macOS), `reclaim_percent` (Linux).
+`report` controls the closing summary: how many top apps to list, when to call an app heavy (1500 MB), and how
+many handles counts as a likely leak (10,000, Windows only).
+
+Settings files from before the goals redesign keep working: `trim_working_sets` is read as `release_idle_memory`.
 
 ## Run it automatically
 
@@ -99,7 +122,7 @@ python3 system_refresh.py --uninstall
 ```
 
 This uses Task Scheduler on Windows, launchd on macOS and cron on Linux. `--require-idle` works on Windows and macOS.
-Install as administrator/root (`--elevate`) if scheduled runs should include the admin-only steps.
+Install as administrator/root (`--elevate`) if scheduled runs should include the admin-only ways.
 
 ## Logs
 
@@ -116,35 +139,34 @@ so apps can feel slightly slower for a moment while they page back in. That's wh
 
 ## Self-test
 
-A freshly set-up machine has little to clean, so `selftest.py` creates its own bloat and checks each step
-against it. It starts a memory hog, a background app that ignores the polite stop signal, orphaned process trees,
-and (on Windows) a window that freezes on purpose. It also builds a sandbox of stale, fresh, read-only, in-use
-and linked temp files.
+A freshly set-up machine has little to clean, so `selftest.py` creates its own bloat and checks each goal
+against it. It starts a memory hog, a background app that ignores the polite stop signal, orphaned process trees
+and a window that freezes on purpose. It also builds a sandbox of stale, fresh, read-only, in-use and linked
+temp files, and checks that `--explain` and `--discover` work.
 
 ```
-python3 selftest.py                          # every step that can run here, about a minute
-python3 selftest.py --only prune_orphans     # one step
-python3 selftest.py --elevate --with-system  # also purge memory caches for real
+python3 selftest.py                          # every goal that can run here, about a minute
+python3 selftest.py --only prune_orphans     # one test
+python3 selftest.py --elevate --with-system  # also the system-wide memory goals, for real
 ```
 
-It only acts on what it created. While a step runs, the tool sees only the test processes, and any attempt to stop
-or trim anything else is blocked and reported as a failure. Two steps run as dry runs because they act on the whole
-system: `restart_shell` always, and `purge_memory_caches` unless you add `--with-system`. Test processes end
-themselves after 5 minutes even if the test is interrupted. The sandbox goes in the system temp folder and is
-removed at the end.
+It only acts on what it created. While a goal runs, the tool sees only the test processes, and any attempt to stop
+or trim anything else is blocked and reported as a failure. Goals that act on the whole system run as dry runs:
+`restart_shell` always, and `purge_memory_caches` (plus `release_idle_memory` on macOS and Linux) unless you add
+`--with-system`. On macOS the frozen-window test may ask you to click its window: macOS only flags an app as Not
+Responding once it misses events. Test processes end themselves after 5 minutes even if the test is interrupted.
 
-It prints PASS, FAIL or SKIP per step, and exits with code 1 if anything failed. A step that doesn't exist on the
-current OS shows as SKIP.
+It prints PASS, FAIL or SKIP per test and exits with code 1 if anything failed. A goal this machine can't reach
+shows as SKIP with the reason.
 
 ## Tested
 
-Windows 11, Python 3.14, psutil 7.2: `selftest.py` passes every step across two runs.
-- **As a standard user:** 8 of 9 pass; the memory purge needs admin rights and is skipped.
-- **With `--elevate --with-system`:** 8 of 9 pass, including a real purge that took the standby cache from
-  4.75 GB to almost nothing. `restart_shell` is skipped there by design.
+**Windows 11** (Python 3.14, psutil 7.2): `selftest.py` passes every test across a standard-user run and an
+elevated `--with-system` run, which included a real purge of the standby cache. `--install` and `--uninstall` were
+checked with a dry-run scheduled task.
 
-Scheduling on Windows has also been checked. `--install` registered the task and one triggered run finished with
-exit code 0 and a full log. That run used a dry-run config, so nothing changed. `--uninstall` then removed the task.
+**macOS 15** (MacBook Pro): a deep elevated run of the version before the goals redesign worked (purge, Finder
+check, temp files, DNS). The new macOS ways have not been run yet: the Not Responding check, memory-pressure
+warnings and `--discover`. Run `selftest.py` there.
 
-**Not yet run:** the macOS and Linux code paths (run `selftest.py` on those machines), scheduling through launchd
-and cron, and a real Explorer or Finder restart.
+**Not yet run:** Linux, scheduling through launchd and cron, and a real Explorer or Finder restart.

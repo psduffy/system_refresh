@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-selftest: checks every system_refresh step against bloat it creates on purpose.
+selftest: checks every system_refresh goal against bloat it creates on purpose.
 
-It starts its own throwaway processes (a memory hog, a background app that ignores the polite
-stop signal, orphaned process trees, and on Windows a window that freezes) plus a sandbox of temp
-files. Then it points each step at them and checks the result. It never acts on anything it didn't
-create: while a step runs, the tool sees only the test processes, and any attempt to stop or trim
-anything else is blocked and counted as a failure.
+It starts its own throwaway processes (a memory hog, a background app that ignores the polite stop
+signal, orphaned process trees, a window that freezes) plus a sandbox of temp files. Then it points
+each goal at them and checks the result. It never acts on anything it didn't create: while a goal
+runs, the tool sees only the test processes, and any attempt to stop or trim anything else is
+blocked and counted as a failure.
 
-  python3 selftest.py                          test every step that can run here
-  python3 selftest.py --only prune_orphans     test one step
-  python3 selftest.py --elevate --with-system  also purge memory caches for real (needs admin/root)
+  python3 selftest.py                          test every goal that can run here
+  python3 selftest.py --only prune_orphans     test one goal
+  python3 selftest.py --elevate --with-system  also run the system-wide memory steps for real
 
 restart_shell always runs as a dry run, because a real run would restart your actual Explorer or
-Finder. purge_memory_caches is a dry run too unless you add --with-system.
+Finder. Goals that act on the whole system (purge_memory_caches, and release_idle_memory on macOS
+and Linux) are dry runs too unless you add --with-system.
 """
 
 import argparse
@@ -30,12 +31,14 @@ import traceback
 
 SELF = os.path.abspath(__file__)
 sys.path.insert(0, os.path.dirname(SELF))
-import system_refresh as sr  # noqa: E402  (explains how to install psutil if it's missing)
+from refresh import common, discover, goals, schedule  # noqa: E402  (explains how to install psutil)
 import psutil  # noqa: E402
 
-NO_WINDOW = 0x08000000 if sr.IS_WINDOWS else 0  # CREATE_NO_WINDOW
+plat = common.platform_module()
+NO_WINDOW = 0x08000000 if common.IS_WINDOWS else 0  # CREATE_NO_WINDOW
 LIFETIME = 300  # seconds; test processes end on their own even if cleanup never runs
 FILE_AGE = 8    # seconds; the temp-file test treats anything older than this as stale
+FROZEN_TITLE = "system_refresh self-test: this window freezes on purpose"
 
 SPAWNED = []  # psutil.Process for everything the test started, ended during cleanup
 POPENS = []   # our direct children, reaped during cleanup
@@ -47,11 +50,14 @@ class Failed(Exception):
 
 # ---------------------------------------------------------------- test processes
 
-def start(role, *args, **popen_args):
+def start(role, *args, **options):
     """Starts this script in a helper role as a background process."""
+    extra = {}
+    if options.get("detach") and not common.IS_WINDOWS:
+        extra["start_new_session"] = True  # no controlling terminal, like a real background app
     popen = subprocess.Popen([sys.executable, SELF, "--role", role] + list(args),
-                             stdin=subprocess.DEVNULL, stdout=popen_args.get("stdout", subprocess.DEVNULL),
-                             stderr=subprocess.DEVNULL, universal_newlines=True, creationflags=NO_WINDOW)
+                             stdin=subprocess.DEVNULL, stdout=options.get("stdout", subprocess.DEVNULL),
+                             stderr=subprocess.DEVNULL, universal_newlines=True, creationflags=NO_WINDOW, **extra)
     POPENS.append(popen)
     return popen
 
@@ -62,9 +68,10 @@ def track(popen_or_pid):
     return proc
 
 
-def orphan(*role):
+def orphan(*role, **options):
     """Starts a role through a launcher that exits at once, so the role is left without a parent."""
-    launcher = start("launch", *role, stdout=subprocess.PIPE)
+    flags = ["--detach"] if options.get("detach") else []
+    launcher = start("launch", *(flags + list(role)), stdout=subprocess.PIPE)
     out, _ = launcher.communicate(timeout=30)
     return track(int(out.strip()))
 
@@ -84,19 +91,20 @@ def alive(proc):
 
 
 def role_sleep(args):
-    if "stubborn" in args and not sr.IS_WINDOWS:
+    if "stubborn" in args and not common.IS_WINDOWS:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)  # makes the tool escalate to a kill
     time.sleep(LIFETIME)
 
 
 def role_hog(args):
-    ballast = b"x" * (300 * sr.MB)  # written out, so every page is really in RAM
+    ballast = b"x" * (300 * common.MB)  # written out, so every page is really in RAM
     time.sleep(LIFETIME)
     return len(ballast)
 
 
 def role_launch(args):
-    print(start(*args).pid)
+    detach = args[:1] == ["--detach"]
+    print(start(*args[1 if detach else 0:], detach=detach).pid)
 
 
 def role_middle(args):
@@ -107,7 +115,7 @@ def role_middle(args):
 
 
 def role_window(args):
-    """A visible window that keeps answering ("pump") or stops after a second ("hang")."""
+    """A visible Windows window that keeps answering ("pump") or stops after a second ("hang")."""
     import ctypes
     from ctypes import wintypes
     user32 = ctypes.WinDLL("user32")
@@ -120,7 +128,7 @@ def role_window(args):
     user32.TranslateMessage.argtypes = [message_pointer]
     user32.DispatchMessageW.argtypes = [message_pointer]
     hang = args[0] == "hang"
-    title = "system_refresh self-test: " + ("this window freezes on purpose" if hang else "test window")
+    title = FROZEN_TITLE if hang else "system_refresh self-test: test window"
     user32.CreateWindowExW(0, "STATIC", title, 0x10CF0000,  # WS_OVERLAPPEDWINDOW | WS_VISIBLE
                            120, 120, 560, 120, None, None, None, None)
     message = wintypes.MSG()
@@ -134,13 +142,27 @@ def role_window(args):
         time.sleep(LIFETIME)  # no more message handling: Windows will call the window "Not Responding"
 
 
-ROLES = {"sleep": role_sleep, "hog": role_hog, "launch": role_launch, "middle": role_middle, "window": role_window}
+def role_tk_window(args):
+    """A Tk window (used on macOS) that shows itself and then stops handling events."""
+    import tkinter
+    root = tkinter.Tk()
+    root.title(FROZEN_TITLE)
+    tkinter.Label(root, text=FROZEN_TITLE, padx=40, pady=40).pack()
+    root.lift()
+    root.update()
+    time.sleep(LIFETIME)
 
 
-# ---------------------------------------------------------------- running steps under guard
+ROLES = {"sleep": role_sleep, "hog": role_hog, "launch": role_launch, "middle": role_middle,
+         "window": role_window, "tk_window": role_tk_window}
+
+
+# ---------------------------------------------------------------- running goals under guard
 
 class Guard(object):
-    """While a step runs, limits the tool to the test processes and blocks actions on anything else."""
+    """While a goal runs, limits the tool to the test processes and blocks actions on anything else."""
+
+    PATCHED = [(common, "stop_processes"), (plat, "trim"), (plat, "hung_windows"), (plat, "unresponsive_apps")]
 
     def __init__(self, procs, isolate=True):
         self.isolate = isolate
@@ -155,53 +177,51 @@ class Guard(object):
                     pass
 
     def __enter__(self):
-        saved = self.saved = {"process_iter": psutil.process_iter}
-        for name in ("stop_processes", "win_trim", "win_hung_windows"):
-            if hasattr(sr, name):
-                saved[name] = getattr(sr, name)
-
+        self.saved = [(module, name, getattr(module, name)) for module, name in self.PATCHED if hasattr(module, name)]
+        original = dict((name, function) for _, name, function in self.saved)
+        original_iter = self.original_iter = psutil.process_iter
         if self.isolate:
-            def process_iter(*args, **kwargs):
-                return (proc for proc in saved["process_iter"](*args, **kwargs) if proc.pid in self.visible)
-            psutil.process_iter = process_iter
+            psutil.process_iter = lambda *a, **k: (p for p in original_iter(*a, **k) if p.pid in self.visible)
 
         def stop_processes(ctx, procs, reason):
             procs = list(procs)
             self.blocked.update(proc.pid for proc in procs if proc.pid not in self.allowed)
-            return saved["stop_processes"](ctx, [proc for proc in procs if proc.pid in self.allowed], reason)
-        sr.stop_processes = stop_processes
+            return original["stop_processes"](ctx, [proc for proc in procs if proc.pid in self.allowed], reason)
+        common.stop_processes = stop_processes
 
-        if "win_trim" in saved:
-            def win_trim(pid, check_only=False):
+        if "trim" in original:
+            def trim(pid, check_only=False):
                 if pid not in self.allowed:
                     self.blocked.add(pid)
                     return False
-                return saved["win_trim"](pid, check_only)
-            sr.win_trim = win_trim
+                return original["trim"](pid, check_only)
+            plat.trim = trim
 
-        if "win_hung_windows" in saved:
-            def win_hung_windows():
-                return {pid: title for pid, title in saved["win_hung_windows"]().items() if pid in self.allowed}
-            sr.win_hung_windows = win_hung_windows
+        for name in ("hung_windows", "unresponsive_apps"):
+            if name in original:
+                setattr(plat, name, self.only_allowed(original[name]))
         return self
 
+    def only_allowed(self, find_frozen):
+        return lambda *args: {pid: title for pid, title in find_frozen(*args).items() if pid in self.allowed}
+
     def __exit__(self, *exc_info):
-        psutil.process_iter = self.saved.pop("process_iter")
-        for name, function in self.saved.items():
-            setattr(sr, name, function)
+        psutil.process_iter = self.original_iter
+        for module, name, function in self.saved:
+            setattr(module, name, function)
         return False
 
 
-class RecordingLog(sr.Log):
-    """The tool's console log, keeping each message so a test can check what the step reported."""
+class RecordingLog(common.Log):
+    """The tool's console log, keeping each message so a test can check what the goal reported."""
 
     def __init__(self):
-        sr.Log.__init__(self, quiet=False)
+        common.Log.__init__(self, quiet=False)
         self.records = []
 
     def __call__(self, message, level="info"):
         self.records.append((level, message))
-        sr.Log.__call__(self, message, level)
+        common.Log.__call__(self, message, level)
 
     def saw(self, text, level=None):
         return any(text in message and level in (None, seen) for seen, message in self.records)
@@ -213,27 +233,26 @@ class Env(object):
         self.sandbox = sandbox
         self.log = log
 
-    def context(self, simulate=False):
-        user = None if sr.IS_WINDOWS else current_user()
-        options = argparse.Namespace(dry_run=simulate, target_user=user)
-        return sr.Context(options, json.loads(json.dumps(sr.DEFAULT_CONFIG)), self.log)
+    def context(self, simulate=False, overrides=None):
+        config = json.loads(json.dumps(common.DEFAULT_CONFIG))
+        for goal, settings in (overrides or {}).items():
+            config["steps"][goal].update(settings)
+        options = argparse.Namespace(dry_run=simulate, deep=True, only=[],
+                                     target_user=None if common.IS_WINDOWS else current_user())
+        return common.Context(options, config, self.log)
 
 
 def current_user():
     """The account running the test, which owns everything the test creates (root under sudo)."""
-    if sr.IS_WINDOWS:
-        import getpass
-        return getpass.getuser()
     import pwd
     return pwd.getpwuid(os.geteuid()).pw_name
 
 
-def run_step(env, name, settings, procs=(), simulate=False, isolate=True):
-    """Runs one tool step with the given settings and returns its outcome."""
-    cfg = json.loads(json.dumps(sr.DEFAULT_CONFIG["steps"][name]))
-    cfg.update(settings)
+def run_goal(env, goal, settings=None, procs=(), simulate=False, isolate=True):
+    """Works toward one goal with the given settings and returns its outcome."""
+    ctx = env.context(simulate, {goal: settings or {}})
     with Guard(procs, isolate) as guard:
-        outcome = sr.STEPS[name](env.context(simulate), cfg)
+        outcome = goals.run_goal(ctx, goal)
     env.log(outcome, "ok")
     if guard.blocked:
         raise Failed("it tried to act on processes the test didn't create (PIDs %s); they were left alone"
@@ -241,128 +260,185 @@ def run_step(env, name, settings, procs=(), simulate=False, isolate=True):
     return outcome
 
 
+def require(env, goal):
+    """Skips the test, with the tool's own reason, when this machine has no way to reach the goal."""
+    goals.choose(env.context(), goal)
+
+
 # ---------------------------------------------------------------- tests
 
+def tool(env, *args):
+    """Runs system_refresh.py as you would; returns (exit code, output)."""
+    config = os.path.join(env.sandbox, "tool_config.json")
+    if not os.path.exists(config):
+        with open(config, "w") as target:
+            json.dump({"log_directory": os.path.join(env.sandbox, "logs")}, target)
+    result = subprocess.run([sys.executable, common.SCRIPT_PATH, "--config", config] + list(args),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            universal_newlines=True, errors="replace", timeout=300, creationflags=NO_WINDOW)
+    if result.returncode or "Traceback" in result.stdout:
+        lines = result.stdout.strip().splitlines()
+        raise Failed("the tool exited with code %d: %s" % (result.returncode, lines[-1] if lines else ""))
+    return result.stdout
+
+
 def test_full_dry_run(env):
-    """the whole tool end to end: a deep dry run of every step"""
-    config = os.path.join(env.sandbox, "dry_run_config.json")
-    with open(config, "w") as target:
-        json.dump({"log_directory": os.path.join(env.sandbox, "logs")}, target)
-    result = subprocess.run([sys.executable, sr.SCRIPT_PATH, "--dry-run", "--deep", "--config", config],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                            errors="replace", timeout=300, creationflags=NO_WINDOW)
-    output = result.stdout
-    lines = output.splitlines()
+    """the whole tool end to end: a deep dry run of every goal"""
+    output = tool(env, "--dry-run", "--deep")
     showing = False
-    for line in lines:
+    for line in output.splitlines():
         showing = showing or line.startswith("== Summary")
         if showing:
             print("    | " + line)
-    if result.returncode or "Traceback" in output:
-        tail = lines[-1].strip() if lines else ""
-        raise Failed("the tool exited with code %d: %s" % (result.returncode, tail))
-    missing = [step for step in sr.STEP_ORDER if step not in output]
+    missing = [goal for goal in common.STEP_ORDER if goal not in output]
     if missing:
         raise Failed("no result from " + ", ".join(missing))
-    failures = [line.strip() for line in lines if "failed:" in line]
+    failures = [line.strip() for line in output.splitlines() if "failed:" in line]
     if failures:
         raise Failed(failures[0])
     if "Available RAM" not in output or "Heaviest apps" not in output:
         raise Failed("the memory snapshot or the app report is missing")
-    return "all %d steps reported; the memory snapshot and app report printed" % len(sr.STEP_ORDER)
+    return "all %d goals reported; the memory snapshot and app report printed" % len(common.STEP_ORDER)
+
+
+def test_explain(env):
+    """--explain: what this machine can do for each goal"""
+    output = tool(env, "--explain")
+    for line in output.splitlines():
+        print("    | " + line)
+    missing = [goal for goal in common.STEP_ORDER if goal not in output]
+    if missing:
+        raise Failed("no entry for " + ", ".join(missing))
+    ready = sum(1 for goal in common.STEP_ORDER if usable(env, goal))
+    return "listed all %d goals; %d can run here as this user" % (len(common.STEP_ORDER), ready)
+
+
+def usable(env, goal):
+    try:
+        require(env, goal)
+        return True
+    except common.StepSkipped:
+        return False
 
 
 def test_kill_hung_apps(env):
     """a window that freezes on purpose"""
-    if not sr.IS_WINDOWS:
-        raise sr.StepSkipped("Windows only")
-    frozen = track(start("window", "hang"))
-    deadline = time.time() + 20
-    while time.time() < deadline and frozen.pid not in sr.win_hung_windows():
+    require(env, "kill_hung_apps")
+    if common.IS_WINDOWS:
+        frozen = track(start("window", "hang"))
+        find = plat.hung_windows
+    else:
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            raise common.StepSkipped("this Python has no tkinter, so the test can't open a window")
+        frozen = track(start("tk_window"))
+        ctx = env.context()
+        find = lambda: plat.unresponsive_apps(ctx)  # noqa: E731
+    deadline, hinted = time.time() + 45, False
+    while time.time() < deadline and frozen.pid not in find():
+        if not alive(frozen):
+            raise Failed("the test window process exited before it could freeze")
+        if common.IS_MAC and not hinted and time.time() > deadline - 38:
+            env.log("macOS flags a frozen app once it misses events: click the window titled \"%s\"" % FROZEN_TITLE)
+            hinted = True
         time.sleep(1)
-    if frozen.pid not in sr.win_hung_windows():
+    if frozen.pid not in find():
+        if common.IS_MAC:
+            raise common.StepSkipped("macOS never flagged the test window as Not Responding; "
+                                     "click it during the test to give it events to miss")
         raise Failed("the test window never showed as Not Responding")
-    run_step(env, "kill_hung_apps", {"confirm_seconds": 3}, [frozen])
+    run_goal(env, "kill_hung_apps", {"confirm_seconds": 3}, [frozen])
     if alive(frozen):
         raise Failed("the frozen test window is still running")
     return "found the frozen test window, re-checked it, and ended it"
 
 
 def test_stop_background_apps(env):
-    """a listed background app that ignores the polite stop signal"""
+    """an approved background app that ignores the polite stop signal"""
     app = track(start("sleep", "stubborn"))
     time.sleep(1)  # let the process name settle (macOS framework Pythons re-exec at startup)
-    name = sr.norm(app.name())
-    run_step(env, "stop_background_apps", {"names": {key: [name] for key in sr.OS_KEYS}}, [app])
+    name = common.norm(app.name())
+    run_goal(env, "stop_background_apps", {"names": {key: [name] for key in common.OS_KEYS}}, [app])
     if alive(app):
         raise Failed("the test app is still running")
-    if sr.IS_WINDOWS:
-        return "stopped the listed test app"
-    return "stopped the listed test app; it ignored SIGTERM, so the follow-up kill did it"
+    if common.IS_WINDOWS:
+        return "stopped the approved test app"
+    return "stopped the approved test app; it ignored SIGTERM, so the follow-up kill did it"
 
 
 def test_prune_orphans(env):
     """an orphaned process tree, and an orphan meant to outlive its parent"""
     doomed = orphan("middle")
-    keeper = orphan("window", "pump") if sr.IS_WINDOWS else orphan("middle", "nohup")
+    keeper = orphan("window", "pump") if common.IS_WINDOWS else orphan("middle", "nohup")
     time.sleep(2)  # let the trees and the window come up
     doomed_tree = family(doomed)
     SPAWNED.extend(doomed_tree + family(keeper))
-    run_step(env, "prune_orphans", {"min_age_minutes": 0, "names": [sr.norm(doomed.name())]}, [doomed, keeper])
+    run_goal(env, "prune_orphans", {"min_age_minutes": 0, "names": [common.norm(doomed.name())]}, [doomed, keeper])
     survivors = [proc for proc in doomed_tree if alive(proc)]
     if survivors:
         raise Failed("%d of the %d orphaned test processes are still running" % (len(survivors), len(doomed_tree)))
     if not alive(keeper):
         raise Failed("it also ended the orphan that should have been kept")
-    reason = "has a window open" if sr.IS_WINDOWS else "was started with nohup"
+    reason = "has a window open" if common.IS_WINDOWS else "was started with nohup"
     return "ended the orphaned test tree (%d processes) and kept the orphan that %s" % (len(doomed_tree), reason)
 
 
 def test_restart_shell(env):
     """dry run only: a real run would restart your actual Explorer or Finder"""
-    return "dry run: " + run_step(env, "restart_shell", {}, simulate=True, isolate=False)
+    return "dry run: " + run_goal(env, "restart_shell", simulate=True, isolate=False)
 
 
-def test_trim_working_sets(env):
-    """a background app holding 300 MB"""
-    if not sr.IS_WINDOWS:
-        raise sr.StepSkipped("Windows only; %s has no way to trim another app's memory" % sr.OS_NAME)
+def test_release_idle_memory(env):
+    """getting background apps to give back idle memory"""
+    require(env, "release_idle_memory")
+    if not common.IS_WINDOWS:
+        return system_wide(env, "release_idle_memory")
     hog = track(start("hog"))
     deadline = time.time() + 30
-    while time.time() < deadline and hog.memory_info().rss < 250 * sr.MB:
+    while time.time() < deadline and hog.memory_info().rss < 250 * common.MB:
         time.sleep(0.5)
     before = hog.memory_info().rss
-    run_step(env, "trim_working_sets", {"min_working_set_mb": 100, "skip_foreground_app": False}, [hog])
+    run_goal(env, "release_idle_memory", {"min_working_set_mb": 100, "skip_foreground_app": False}, [hog])
     after = hog.memory_info().rss
     if after > before / 2:
-        raise Failed("the test app's working set only went from %s to %s" % (sr.fmt_bytes(before), sr.fmt_bytes(after)))
-    return "the test app's working set went from %s to %s" % (sr.fmt_bytes(before), sr.fmt_bytes(after))
+        raise Failed("the test app's working set only went from %s to %s"
+                     % (common.fmt_bytes(before), common.fmt_bytes(after)))
+    return "a 300 MB test app's working set went from %s to %s" % (common.fmt_bytes(before), common.fmt_bytes(after))
+
+
+def system_wide(env, goal):
+    """Goals that act on the whole system run for real only with --with-system."""
+    if not env.args.with_system:
+        return "dry run: %s (add --with-system to run it for real)" % run_goal(env, goal, simulate=True)
+    outcome = run_goal(env, goal)
+    warnings = [message for level, message in env.log.records if level == "warn"]
+    if warnings:
+        raise Failed(warnings[0])
+    return outcome
 
 
 def cache_bytes():
-    if sr.IS_WINDOWS:
-        return sr.win_memory_lists().get("standby", 0)
+    if common.IS_WINDOWS:
+        return plat.memory_lists().get("standby", 0)
     memory = psutil.virtual_memory()
-    if sr.IS_MAC:
+    if common.IS_MAC:
         return memory.inactive
     return getattr(memory, "cached", 0) + getattr(memory, "buffers", 0)
 
 
 def test_purge_memory_caches(env):
-    """the system-wide memory purge (a dry run unless --with-system)"""
-    if not env.args.with_system:
-        return "dry run: %s (add --with-system to purge for real)" % run_step(
-            env, "purge_memory_caches", {}, simulate=True)
+    """the system-wide cache purge (a dry run unless --with-system)"""
+    require(env, "purge_memory_caches")
     before = cache_bytes()
-    outcome = run_step(env, "purge_memory_caches", {})
-    warnings = [message for level, message in env.log.records if level == "warn"]
-    if warnings:
-        raise Failed(warnings[0])
-    return "%s; cache %s -> %s" % (outcome, sr.fmt_bytes(before), sr.fmt_bytes(cache_bytes()))
+    outcome = system_wide(env, "purge_memory_caches")
+    if env.args.with_system:
+        outcome += "; cache %s -> %s" % (common.fmt_bytes(before), common.fmt_bytes(cache_bytes()))
+    return outcome
 
 
 def make_link(target, link):
-    if not sr.IS_WINDOWS:
+    if not common.IS_WINDOWS:
         os.symlink(target, link)
         return
     try:
@@ -387,7 +463,7 @@ def test_clean_temp_files(env):
 
     stale = [write(root, "stale.txt"), write(root, "read_only.txt"), write(root, "old_folder", "stale.txt")]
     os.chmod(stale[1], stat.S_IREAD)
-    in_use = write(root, "in_use.txt") if sr.IS_WINDOWS else None
+    in_use = write(root, "in_use.txt") if common.IS_WINDOWS else None
     precious = write(outside, "precious.txt")
     make_link(outside, os.path.join(root, "link"))
     time.sleep(FILE_AGE + 2)
@@ -396,11 +472,10 @@ def test_clean_temp_files(env):
     yesterday = time.time() - 86400
     os.utime(unpacked, (yesterday, yesterday))
 
-    ctx_home = env.context().home
-    settings = {"older_than_days": FILE_AGE / 86400.0, "paths": [root, ctx_home]}
+    settings = {"older_than_days": FILE_AGE / 86400.0, "paths": [root, env.context().home]}
     holder = open(in_use, "rb") if in_use else None
     try:
-        run_step(env, "clean_temp_files", settings)
+        run_goal(env, "clean_temp_files", settings)
     finally:
         if holder:
             holder.close()
@@ -424,15 +499,30 @@ def test_clean_temp_files(env):
 
 def test_flush_dns(env):
     """a real DNS cache flush (harmless: names are simply looked up again)"""
-    return run_step(env, "flush_dns", {}, isolate=False)
+    return run_goal(env, "flush_dns", isolate=False)
 
 
-TESTS = [("full_dry_run", test_full_dry_run)] + [(step, globals()["test_" + step]) for step in sr.STEP_ORDER]
+def test_discover(env):
+    """--discover: finding a background app nobody is using"""
+    app = orphan("sleep", detach=True)  # orphaned, so it isn't counted as part of the terminal or app running this test
+    time.sleep(1)
+    ctx = env.context()
+    found = discover.candidates(ctx)
+    discover.show(ctx, found, limit=8)
+    group = next((group for group in found if app.pid in group["pids"]), None)
+    if not group:
+        raise Failed("the test background app (PID %d) wasn't listed" % app.pid)
+    return "listed %d candidate app(s), including the test background app as \"%s\"" % (len(found), group["name"])
+
+
+TESTS = [("full_dry_run", test_full_dry_run), ("explain", test_explain)] + \
+        [(goal, globals()["test_" + goal]) for goal in common.STEP_ORDER] + [("discover", test_discover)]
 
 
 # ---------------------------------------------------------------- main
 
 def cleanup():
+    """Ends every test process so far, so one test's leftovers can't sway the next."""
     for proc in SPAWNED:
         for member in reversed(family(proc)):
             try:
@@ -444,13 +534,15 @@ def cleanup():
             popen.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             pass
+    del SPAWNED[:]
+    del POPENS[:]
 
 
 def remove_sandbox(path):
     link = os.path.join(path, "temp", "link")
     if os.path.lexists(link):  # unlink first, so nothing behind the link is touched
         try:
-            os.rmdir(link) if sr.IS_WINDOWS else os.unlink(link)
+            os.rmdir(link) if common.IS_WINDOWS else os.unlink(link)
         except OSError:
             pass
     for folder, _, files in os.walk(path):
@@ -464,11 +556,11 @@ def remove_sandbox(path):
 
 def parse_args(argv):
     names = [name for name, _ in TESTS]
-    parser = argparse.ArgumentParser(description="Check every system_refresh step against bloat this test creates.")
-    parser.add_argument("--only", type=sr.step_list, default=[], metavar="TESTS",
-                        help="run just these comma-separated tests: " + ", ".join(names))
+    parser = argparse.ArgumentParser(description="Check every system_refresh goal against bloat this test creates.")
+    parser.add_argument("--only", type=lambda text: [part.strip() for part in text.split(",") if part.strip()],
+                        default=[], metavar="TESTS", help="run just these comma-separated tests: " + ", ".join(names))
     parser.add_argument("--with-system", action="store_true",
-                        help="purge memory caches for real (needs administrator or root)")
+                        help="run the system-wide memory goals for real (needs administrator or root)")
     parser.add_argument("--elevate", action="store_true", help="relaunch as administrator (UAC) or root (sudo)")
     parser.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -486,13 +578,13 @@ def main():
     args = parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
-    if args.elevate and not sr.is_admin():
-        return sr.relaunch_elevated(argv, script=SELF)
+    if args.elevate and not common.is_admin():
+        return schedule.relaunch_elevated(argv, script=SELF)
 
     log = RecordingLog()
-    who = ("administrator" if sr.IS_WINDOWS else "root") if sr.is_admin() else "standard user"
+    who = common.ADMIN if common.is_admin() else "standard user"
     log("system_refresh self-test on %s: Python %s, psutil %s, %s" % (
-        sr.OS_NAME, sys.version.split()[0], psutil.__version__, who), "head")
+        common.os_label(), sys.version.split()[0], psutil.__version__, who), "head")
     sandbox = tempfile.mkdtemp(prefix="system_refresh_selftest_")
     env = Env(args, sandbox, log)
     results = []
@@ -504,13 +596,14 @@ def main():
             del log.records[:]
             try:
                 status, detail = "PASS", test(env)
-            except sr.StepSkipped as reason:
+            except common.StepSkipped as reason:
                 status, detail = "SKIP", str(reason)
             except Failed as reason:
                 status, detail = "FAIL", str(reason)
             except Exception as error:  # a crash in one test must not stop the others
                 traceback.print_exc()
                 status, detail = "FAIL", "error: %s" % error
+            cleanup()
             log("%s: %s" % (status, detail), {"PASS": "ok", "FAIL": "warn", "SKIP": "skip"}[status])
             results.append((name, status, detail))
     finally:
