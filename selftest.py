@@ -233,24 +233,23 @@ class Env(object):
         self.sandbox = sandbox
         self.log = log
 
-    def context(self, simulate=False, overrides=None):
+    def context(self, simulate=False, overrides=None, real_user=False):
+        """A run context. It acts for the account running the test, which owns everything the test creates
+        (root under sudo); with real_user it acts for the person behind sudo, like a normal elevated run."""
         config = json.loads(json.dumps(common.DEFAULT_CONFIG))
         for goal, settings in (overrides or {}).items():
             config["steps"][goal].update(settings)
-        options = argparse.Namespace(dry_run=simulate, deep=True, only=[],
-                                     target_user=None if common.IS_WINDOWS else current_user())
+        user = None
+        if not common.IS_WINDOWS:
+            import pwd
+            user = (real_user and os.environ.get("SUDO_USER")) or pwd.getpwuid(os.geteuid()).pw_name
+        options = argparse.Namespace(dry_run=simulate, deep=True, only=[], target_user=user)
         return common.Context(options, config, self.log)
 
 
-def current_user():
-    """The account running the test, which owns everything the test creates (root under sudo)."""
-    import pwd
-    return pwd.getpwuid(os.geteuid()).pw_name
-
-
-def run_goal(env, goal, settings=None, procs=(), simulate=False, isolate=True):
+def run_goal(env, goal, settings=None, procs=(), simulate=False, isolate=True, real_user=False):
     """Works toward one goal with the given settings and returns its outcome."""
-    ctx = env.context(simulate, {goal: settings or {}})
+    ctx = env.context(simulate, {goal: settings or {}}, real_user)
     with Guard(procs, isolate) as guard:
         outcome = goals.run_goal(ctx, goal)
     env.log(outcome, "ok")
@@ -289,7 +288,7 @@ def test_full_dry_run(env):
     for line in output.splitlines():
         showing = showing or line.startswith("== Summary")
         if showing:
-            print("    | " + line)
+            env.log("| " + line)
     missing = [goal for goal in common.STEP_ORDER if goal not in output]
     if missing:
         raise Failed("no result from " + ", ".join(missing))
@@ -305,7 +304,7 @@ def test_explain(env):
     """--explain: what this machine can do for each goal"""
     output = tool(env, "--explain")
     for line in output.splitlines():
-        print("    | " + line)
+        env.log("| " + line)
     missing = [goal for goal in common.STEP_ORDER if goal not in output]
     if missing:
         raise Failed("no entry for " + ", ".join(missing))
@@ -374,6 +373,9 @@ def test_prune_orphans(env):
     time.sleep(2)  # let the trees and the window come up
     doomed_tree = family(doomed)
     SPAWNED.extend(doomed_tree + family(keeper))
+    if not common.IS_WINDOWS and plat.started_with_nohup(keeper.pid) is not True:
+        raise Failed("can't see that the nohup test process ignores SIGHUP, so nohup'd processes aren't "
+                     "recognized here: %s" % nohup_diagnostics(keeper.pid))
     run_goal(env, "prune_orphans", {"min_age_minutes": 0, "names": [common.norm(doomed.name())]}, [doomed, keeper])
     survivors = [proc for proc in doomed_tree if alive(proc)]
     if survivors:
@@ -384,9 +386,24 @@ def test_prune_orphans(env):
     return "ended the orphaned test tree (%d processes) and kept the orphan that %s" % (len(doomed_tree), reason)
 
 
+def nohup_diagnostics(pid):
+    """What the OS reports about a process's ignored signals, for a failure message."""
+    if common.IS_LINUX:
+        try:
+            with open("/proc/%d/status" % pid) as status:
+                return "; ".join(line.strip() for line in status if line.startswith("SigIgn:"))
+        except OSError as error:
+            return str(error)
+    reports = []
+    for keyword in ("ignored", "sigignore"):
+        code, out = common.run(["ps", "-o", keyword + "=", "-p", str(pid)])
+        reports.append("ps -o %s= gave exit %d, %r" % (keyword, code, out))
+    return "; ".join(reports)
+
+
 def test_restart_shell(env):
     """dry run only: a real run would restart your actual Explorer or Finder"""
-    return "dry run: " + run_goal(env, "restart_shell", simulate=True, isolate=False)
+    return "dry run: " + run_goal(env, "restart_shell", simulate=True, isolate=False, real_user=True)
 
 
 def test_release_idle_memory(env):
@@ -408,10 +425,12 @@ def test_release_idle_memory(env):
 
 
 def system_wide(env, goal):
-    """Goals that act on the whole system run for real only with --with-system."""
+    """Goals that act on the whole system run for real only with --with-system. They act for you, as a normal
+    elevated run would, and see every process (they read memory; stopping anything stays blocked)."""
     if not env.args.with_system:
-        return "dry run: %s (add --with-system to run it for real)" % run_goal(env, goal, simulate=True)
-    outcome = run_goal(env, goal)
+        outcome = run_goal(env, goal, simulate=True, isolate=False, real_user=True)
+        return "dry run: %s (add --with-system to run it for real)" % outcome
+    outcome = run_goal(env, goal, isolate=False, real_user=True)
     warnings = [message for level, message in env.log.records if level == "warn"]
     if warnings:
         raise Failed(warnings[0])
@@ -554,6 +573,24 @@ def remove_sandbox(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+def open_log(log):
+    """Saves the self-test's output as logs/selftest-<time>.log next to the tool, to paste or attach."""
+    folder = os.path.join(common.SCRIPT_DIR, "logs")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "selftest-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+    log.open(path)
+    owner = os.environ.get("SUDO_USER")
+    if not common.IS_WINDOWS and os.geteuid() == 0 and owner:  # under sudo, hand the log back to its user
+        import pwd
+        entry = pwd.getpwnam(owner)
+        for item in (folder, path):
+            try:
+                os.chown(item, entry.pw_uid, entry.pw_gid)
+            except OSError:
+                pass
+    return path
+
+
 def parse_args(argv):
     names = [name for name, _ in TESTS]
     parser = argparse.ArgumentParser(description="Check every system_refresh goal against bloat this test creates.")
@@ -582,6 +619,7 @@ def main():
         return schedule.relaunch_elevated(argv, script=SELF)
 
     log = RecordingLog()
+    log_path = open_log(log)
     who = common.ADMIN if common.is_admin() else "standard user"
     log("system_refresh self-test on %s: Python %s, psutil %s, %s" % (
         common.os_label(), sys.version.split()[0], psutil.__version__, who), "head")
@@ -601,7 +639,9 @@ def main():
             except Failed as reason:
                 status, detail = "FAIL", str(reason)
             except Exception as error:  # a crash in one test must not stop the others
-                traceback.print_exc()
+                trace = traceback.format_exc()
+                print(trace)
+                log(trace.strip(), "detail")
                 status, detail = "FAIL", "error: %s" % error
             cleanup()
             log("%s: %s" % (status, detail), {"PASS": "ok", "FAIL": "warn", "SKIP": "skip"}[status])
@@ -614,7 +654,8 @@ def main():
     for name, status, detail in results:
         log("%s  %-21s %s" % (status, name, detail), {"PASS": "ok", "FAIL": "warn", "SKIP": "skip"}[status])
     counts = dict((status, sum(1 for _, seen, _ in results if seen == status)) for status in ("PASS", "FAIL", "SKIP"))
-    log("%d passed, %d failed, %d skipped" % (counts["PASS"], counts["FAIL"], counts["SKIP"]), "head")
+    log("%d passed, %d failed, %d skipped; log: %s" % (counts["PASS"], counts["FAIL"], counts["SKIP"], log_path),
+        "head")
     if args.pause:
         try:
             input("\nPress Enter to close...")

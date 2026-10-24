@@ -126,8 +126,9 @@ Install as administrator/root (`--elevate`) if scheduled runs should include the
 
 ## Logs
 
-Each run writes `logs/refresh-YYYYMMDD-HHMMSS.log`, including per-process detail the console leaves out.
-The newest 30 are kept (`keep_logs`).
+Each refresh run (with or without `--dry-run`) writes `logs/refresh-YYYYMMDD-HHMMSS.log`, including per-process
+detail the console leaves out. The newest 30 are kept (`keep_logs`). `selftest.py` saves its results as
+`logs/selftest-YYYYMMDD-HHMMSS.log`. `--explain` and `--discover` only print to the screen.
 
 ## What to expect
 
@@ -165,8 +166,11 @@ shows as SKIP with the reason.
 elevated `--with-system` run, which included a real purge of the standby cache. `--install` and `--uninstall` were
 checked with a dry-run scheduled task.
 
-**macOS 15** (MacBook Pro): a deep elevated run of the version before the goals redesign worked (purge, Finder
-check, temp files, DNS). The new macOS ways have not been run yet: the Not Responding check, memory-pressure
-warnings and `--discover`. Run `selftest.py` there.
+**macOS 15.8** (MacBook Pro, Python 3.13, `--elevate --with-system`): the first self-test of the goals redesign
+passed 9 of 11. The passes include the Not Responding check, a real memory-pressure warning, a real purge and
+discovery. It also found two problems, both fixed since and awaiting a re-run:
+- An orphan started with `nohup` wasn't recognized as one, so it was ended. When the tool can't tell, it now keeps
+  the orphan.
+- The self-test's Finder dry run looked for root's Finder instead of yours.
 
 **Not yet run:** Linux, scheduling through launchd and cron, and a real Explorer or Finder restart.

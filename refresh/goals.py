@@ -92,7 +92,10 @@ class OrphanTrees(Strategy):
             reason = keeper(node, name)
             if reason:
                 return reason
-        if ctx.platform.started_with_nohup(tree[0].pid):
+        nohup = ctx.platform.started_with_nohup(tree[0].pid)
+        if nohup is None:  # not knowing must never end something its owner meant to keep running
+            return "couldn't check whether it was started with nohup"
+        if nohup:
             return "it was started with nohup"
         return None
 

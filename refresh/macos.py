@@ -86,11 +86,15 @@ def launch_agents(ctx):
 
 
 def started_with_nohup(pid):
-    code, out = run(["ps", "-o", "sigignore=", "-p", str(pid)])
-    try:
-        return code == 0 and bool(int(out.strip(), 16) & 1)  # bit 0 is SIGHUP
-    except ValueError:
-        return False
+    """True if the process ignores SIGHUP, as nohup makes it; None when ps can't tell."""
+    for keyword in ("ignored", "sigignore"):  # macOS's ps names the field "ignored"; other BSDs also "sigignore"
+        code, out = run(["ps", "-o", keyword + "=", "-p", str(pid)])
+        if code == 0 and out.strip():
+            try:
+                return bool(int(out.strip(), 16) & 1)  # bit 0 is SIGHUP
+            except ValueError:
+                return None
+    return None
 
 
 class _PSN(ctypes.Structure):
