@@ -85,16 +85,58 @@ def launch_agents(ctx):
     return found
 
 
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int32)]
+
+
+class _ExternProc(ctypes.Structure):
+    """The start of struct extern_proc (sys/proc.h), the kp_proc half of what sysctl KERN_PROC_PID returns.
+    Only the fields up to p_sigignore are declared; ctypes lays them out with the same padding the C compiler does."""
+    _fields_ = [("p_un", _Timeval * 1),  # a union of two pointers and a timeval: 16 bytes either way
+                ("p_vmspace", ctypes.c_void_p), ("p_sigacts", ctypes.c_void_p),
+                ("p_flag", ctypes.c_int), ("p_stat", ctypes.c_char),
+                ("p_pid", ctypes.c_int32), ("p_oppid", ctypes.c_int32), ("p_dupfd", ctypes.c_int),
+                ("user_stack", ctypes.c_void_p), ("exit_thread", ctypes.c_void_p),
+                ("p_debugger", ctypes.c_int), ("sigwait", ctypes.c_int),
+                ("p_estcpu", ctypes.c_uint), ("p_cpticks", ctypes.c_int), ("p_pctcpu", ctypes.c_uint32),
+                ("p_wchan", ctypes.c_void_p), ("p_wmesg", ctypes.c_void_p),
+                ("p_swtime", ctypes.c_uint), ("p_slptime", ctypes.c_uint),
+                ("p_realtimer", _Timeval * 2), ("p_rtime", _Timeval),
+                ("p_uticks", ctypes.c_uint64), ("p_sticks", ctypes.c_uint64), ("p_iticks", ctypes.c_uint64),
+                ("p_traceflag", ctypes.c_int), ("p_tracep", ctypes.c_void_p),
+                ("p_siglist", ctypes.c_int), ("p_textvp", ctypes.c_void_p), ("p_holdcnt", ctypes.c_int),
+                ("p_sigmask", ctypes.c_uint32), ("p_sigignore", ctypes.c_uint32), ("p_sigcatch", ctypes.c_uint32)]
+
+
+_CTL_KERN, _KERN_PROC, _KERN_PROC_PID = 1, 14, 1
+
+
+def ignored_signals(pid):
+    """The process's ignored-signal mask from the kernel (sysctl KERN_PROC_PID), or None if it can't be read.
+    macOS's ps has no keyword for this (FreeBSD's "sigignore" and "ignored" don't exist there), so ask the kernel."""
+    try:
+        libc = ctypes.CDLL("/usr/lib/libc.dylib", use_errno=True)
+    except OSError:
+        return None
+    mib = (ctypes.c_int * 4)(_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid)
+    buffer = ctypes.create_string_buffer(1024)  # struct kinfo_proc is 648 bytes on 64-bit macOS
+    size = ctypes.c_size_t(ctypes.sizeof(buffer))
+    if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+        return None
+    if size.value < ctypes.sizeof(_ExternProc):  # no such process, or a layout this code doesn't know
+        return None
+    proc = _ExternProc.from_buffer_copy(buffer.raw[:ctypes.sizeof(_ExternProc)])
+    if proc.p_pid != pid:  # the layout guess is off; reading further would be reading the wrong field
+        return None
+    return proc.p_sigignore
+
+
 def started_with_nohup(pid):
-    """True if the process ignores SIGHUP, as nohup makes it; None when ps can't tell."""
-    for keyword in ("ignored", "sigignore"):  # macOS's ps names the field "ignored"; other BSDs also "sigignore"
-        code, out = run(["ps", "-o", keyword + "=", "-p", str(pid)])
-        if code == 0 and out.strip():
-            try:
-                return bool(int(out.strip(), 16) & 1)  # bit 0 is SIGHUP
-            except ValueError:
-                return None
-    return None
+    """True if the process ignores SIGHUP, as nohup makes it; None when that can't be read."""
+    mask = ignored_signals(pid)
+    if mask is None:
+        return None
+    return bool(mask & 1)  # sigmask(SIGHUP): bit 0, since SIGHUP is signal 1
 
 
 class _PSN(ctypes.Structure):

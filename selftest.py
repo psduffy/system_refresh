@@ -394,11 +394,10 @@ def nohup_diagnostics(pid):
                 return "; ".join(line.strip() for line in status if line.startswith("SigIgn:"))
         except OSError as error:
             return str(error)
-    reports = []
-    for keyword in ("ignored", "sigignore"):
-        code, out = common.run(["ps", "-o", keyword + "=", "-p", str(pid)])
-        reports.append("ps -o %s= gave exit %d, %r" % (keyword, code, out))
-    return "; ".join(reports)
+    mask = plat.ignored_signals(pid)
+    code, out = common.run(["ps", "-o", "pid=,ppid=,command=", "-p", str(pid)])
+    return "sysctl KERN_PROC_PID gave p_sigignore %s; ps shows %r" % (
+        "unreadable" if mask is None else "0x%08x" % mask, out.strip())
 
 
 def test_restart_shell(env):

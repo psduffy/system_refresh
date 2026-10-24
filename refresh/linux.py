@@ -39,7 +39,7 @@ def started_with_nohup(pid):
                     return bool(int(line.split()[1], 16) & 1)  # bit 0 is SIGHUP
     except (OSError, ValueError):
         pass
-    return False
+    return None  # couldn't read it, so the orphan is kept
 
 
 def desktop_entries(folders):
