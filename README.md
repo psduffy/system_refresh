@@ -166,11 +166,15 @@ shows as SKIP with the reason.
 elevated `--with-system` run, which included a real purge of the standby cache. `--install` and `--uninstall` were
 checked with a dry-run scheduled task.
 
-**macOS 15.8** (MacBook Pro, Python 3.13, `--elevate --with-system`): the first self-test of the goals redesign
-passed 9 of 11. The passes include the Not Responding check, a real memory-pressure warning, a real purge and
-discovery. It also found two problems, both fixed since and awaiting a re-run:
-- An orphan started with `nohup` wasn't recognized as one, so it was ended. When the tool can't tell, it now keeps
-  the orphan.
+**macOS 15.8** (MacBook Pro, Python 3.13, `--elevate --with-system`): `selftest.py` passes all 11 tests across
+three runs, including the Not Responding check, a real memory-pressure warning, a real purge, a real DNS flush and
+discovery. Getting there took two fixes:
+- An orphan started with `nohup` wasn't recognized, so it was ended. macOS's `ps` has no field for ignored signals,
+  so the tool now reads them from the kernel's process record (`sysctl` `KERN_PROC_PID`). If it still can't tell, it
+  keeps the orphan.
 - The self-test's Finder dry run looked for root's Finder instead of yours.
 
-**Not yet run:** Linux, scheduling through launchd and cron, and a real Explorer or Finder restart.
+**Linux:** `selftest.py` has run only in an Ubuntu 24.04 container (as root, cgroup v1, no desktop): 7 passed and
+4 skipped because the container lacks what those goals use. It has not run on RHEL or a Linux desktop.
+
+**Not yet run:** RHEL, scheduling through launchd and cron, and a real Explorer or Finder restart.
